@@ -60,10 +60,11 @@ if False:
 # c classes
 # d >= c
 
-nclass = 8
-ndim = 5
-nsamp = 20
-
+nclass = 20
+nclass_train = nclass // 2 # withold some classes from training for PLDA
+ndim = 6
+nsamp = 50
+nsamp_train = 6
 
 if True:
     # randomized case
@@ -94,8 +95,8 @@ else:
 x = mu[:, :, np.newaxis] + np.einsum('ij,jk...->ik...', rootSigma, np.random.randn(ndim, nclass, nsamp))
 
 # sample mean and per-class scatter matrices
-m = np.mean(x, axis=2)
-d = x - m[:, :, np.newaxis]
+m = np.mean(x[:, :, :nsamp_train], axis=2)
+d = x[:, :, :nsamp_train] - m[:, :, np.newaxis]
 S = np.sum(d[:, np.newaxis, :, :] * d[np.newaxis, :, :, :], axis=3)
 
 # total within-class scatter matrix
@@ -147,8 +148,7 @@ plt.title(f'After LDA transformation (first 2 of {nclass-1} dims shown)')
 
 ## Now on to PLDA.
 
-nclass_train = nclass - 2 # withold some classes from training
-nsamp_train = nsamp // 2
+
 import plda 
 
 # arrange data into single set with corresonding labels
@@ -170,21 +170,27 @@ test_labels = np.reshape(test_labels, (nclass * nsamp, ))
 
 # Use as many principal components in the data as possible.
 plda_model = plda.Classifier()
-plda_model.fit_model(x_train, training_labels)
+plda_model.fit_model(x_train, training_labels, n_principal_components=ndim)
 
 
 print(plda_model.model.prior_params['cov_diag'])
 print(plda_model.model.posterior_params[0]['cov_diag'])
 
 U_model = plda_model.model.transform(x_test, from_space='D', to_space='U_model')
-print(U_model.shape)
 
 U_model_by_class = np.reshape(U_model.transpose(), (-1, nclass, nsamp))
+transformed_sample_means = np.mean(U_model_by_class[:,:,:nsamp_train], axis=2)  # (ndim, nclass)
+classwise_centers = np.array([plda_model.model.posterior_params[c]['mean'] for c in range(nclass_train)])
+
 plt.figure()
 for c in range(nclass):
     plt.scatter(U_model_by_class[-1, c, :], U_model_by_class[-2, c, :])
-    plt.plot(np.mean(U_model_by_class[-1, c, :]), np.mean(U_model_by_class[-2, c, :]), 'ks')
-plt.title(f'After PLDA transformation (last 2 of {ndim} dims shown)')
+plt.scatter(transformed_sample_means[-1, :], transformed_sample_means[-2, :], c='k', marker='s', label='Sample Means')
+plt.scatter(classwise_centers[:, -1], classwise_centers[:, -2], c='c', marker='s', label='Model Centers')
+plt.legend()
+plt.title(f'After PLDA transformation (last 2 of {ndim} dims shown)\n Model centers fit by EM are close to sample means')
+
+# breakpoint()
 
 if (nclass * nsamp) < 200:
     # comparison of each example (including classes not seen during fit)
@@ -211,7 +217,7 @@ else:
 log_ratios_same = []
 log_ratios_diff = []
 
-for ii in range(0, 1000):
+for ii in range(0, 10000):
     ind_0 = np.random.randint(nclass * nsamp)
     ind_1 = np.random.randint(nclass * nsamp)
 
@@ -224,6 +230,15 @@ for ii in range(0, 1000):
 log_ratios_diff = np.array(log_ratios_diff)
 log_ratios_same = np.array(log_ratios_same)
 
+
+# get ROC: probability of correct or false detection as decision threshold is varied
+threshvals = np.linspace(-2, 5, num=1000)
+pfa =  np.zeros_like(threshvals)
+pd = np.zeros_like(threshvals)
+for ii, thresh in enumerate(threshvals):
+    pd[ii] = np.sum(log_ratios_same>thresh) / len(log_ratios_same)
+    pfa[ii] = np.sum(log_ratios_diff>thresh) / len(log_ratios_diff)
+
 plt.figure()
 plt.plot(np.sort(log_ratios_same), np.linspace(0, 1, len(log_ratios_same)), label='Same Class')
 plt.plot(np.sort(log_ratios_diff), np.linspace(0, 1, len(log_ratios_diff)), label='Different Class')
@@ -232,21 +247,105 @@ plt.xlabel('Log Likelihood Ratio')
 plt.ylabel('Empirical CDF')
 plt.xlim(-5, 5)
 
-# get ROC: probability of correct or false detection as decision threshold is varied
-threshvals = np.linspace(-2, 5, num=100)
-pfa =  np.zeros_like(threshvals)
-pd = np.zeros_like(threshvals)
-for ii, thresh in enumerate(threshvals):
-    pd[ii] = np.sum(log_ratios_same>thresh) / len(log_ratios_same)
-    pfa[ii] = np.sum(log_ratios_diff>thresh) / len(log_ratios_diff)
-
-plt.figure()
-plt.plot(pfa, pd)
-plt.title('ROC')
+plt.figure(10)
+plt.plot(pfa, pd, label="ROC for Comparing Against a single Enrollment Vector")
+plt.title('ROCs')
 plt.xlabel('P_FA = Different Class incorrectly labeled same')
 plt.ylabel('P_D = Same class correctly detected')
-plt.show()
 
+plt.figure(11)
+plt.loglog(pfa, 1-pd, label="ROC for Comparing Against a single Enrollment Vector")
+plt.title('ROCs')
+plt.xlabel('log10(False Positive %)')
+plt.ylabel('log10(False Negative %)')
+
+# get a second ROC where test vectors are compared to the class means
+# TODO. this is not right yet. Ioffe gives the right formulae for posterior probabilities
+# for same / different for a multi-example "gallery". Need to use those.
+log_ratios_same_mean = []
+log_ratios_diff_mean = []
+
+for ii in range(0, 10000):
+    ind_test_vec = np.random.randint(nclass * nsamp)
+    ind_class = np.random.randint(nclass)
+
+    log_ratio = plda_model.model.calc_same_diff_log_likelihood_ratio(U_model[ind_test_vec][None,], transformed_sample_means[:, ind_class][None,])
+    if test_labels[ind_test_vec] == ind_class:
+        log_ratios_same_mean.append(log_ratio)
+    else:
+        log_ratios_diff_mean.append(log_ratio)
+
+log_ratios_diff_mean = np.array(log_ratios_diff_mean)
+log_ratios_same_mean = np.array(log_ratios_same_mean)
+
+
+# get ROC: probability of correct or false detection as decision threshold is varied
+threshvals = np.linspace(-2, 5, num=1000)
+pfa_mean =  np.zeros_like(threshvals)
+pd_mean = np.zeros_like(threshvals)
+for ii, thresh in enumerate(threshvals):
+    pd_mean[ii] = np.sum(log_ratios_same_mean>thresh) / len(log_ratios_same_mean)
+    pfa_mean[ii] = np.sum(log_ratios_diff_mean>thresh) / len(log_ratios_diff_mean)
+
+# plt.figure()
+# plt.plot(np.sort(log_ratios_same), np.linspace(0, 1, len(log_ratios_same)), label='Same Class')
+# plt.plot(np.sort(log_ratios_diff), np.linspace(0, 1, len(log_ratios_diff)), label='Different Class')
+# plt.legend()
+# plt.xlabel('Log Likelihood Ratio')
+# plt.ylabel('Empirical CDF')
+# plt.xlim(-5, 5)
+
+plt.figure(10)
+plt.plot(pfa_mean, pd_mean, label='ROC for Comparing Against Mean of Enrollment Gallery')
+plt.figure(11)
+plt.loglog(pfa_mean, 1-pd_mean, label='ROC for Comparing Against Mean of Enrollment Gallery')
+
+
+# get a third ROC where test vectors are compared to the full multi-example "gallery"
+log_ratios_same_mean = []
+log_ratios_diff_mean = []
+
+for ii in range(0, 10000):
+    ind_test_vec = np.random.randint(nclass * nsamp)
+    ind_class = np.random.randint(nclass)
+    inds_gallery = range(ind_class*nsamp, (ind_class*nsamp+nsamp_train))
+
+    log_ratio = plda_model.model.calc_same_diff_log_likelihood_ratio(U_model[ind_test_vec][None,], U_model_g=U_model[inds_gallery])
+    if test_labels[ind_test_vec] == ind_class:
+        log_ratios_same_mean.append(log_ratio)
+    else:
+        log_ratios_diff_mean.append(log_ratio)
+
+log_ratios_diff_mean = np.array(log_ratios_diff_mean)
+log_ratios_same_mean = np.array(log_ratios_same_mean)
+
+
+# get ROC: probability of correct or false detection as decision threshold is varied
+threshvals = np.linspace(-2, 5, num=1000)
+pfa_mean =  np.zeros_like(threshvals)
+pd_mean = np.zeros_like(threshvals)
+for ii, thresh in enumerate(threshvals):
+    pd_mean[ii] = np.sum(log_ratios_same_mean>thresh) / len(log_ratios_same_mean)
+    pfa_mean[ii] = np.sum(log_ratios_diff_mean>thresh) / len(log_ratios_diff_mean)
+
+# plt.figure()
+# plt.plot(np.sort(log_ratios_same), np.linspace(0, 1, len(log_ratios_same)), label='Same Class')
+# plt.plot(np.sort(log_ratios_diff), np.linspace(0, 1, len(log_ratios_diff)), label='Different Class')
+# plt.legend()
+# plt.xlabel('Log Likelihood Ratio')
+# plt.ylabel('Empirical CDF')
+# plt.xlim(-5, 5)
+
+plt.figure(10)
+plt.plot(pfa_mean, pd_mean, label='ROC for Comparing Against Multiexample Enrollment')
+plt.legend()
+
+plt.figure(11)
+plt.loglog(pfa_mean, 1-pd_mean, label='ROC for Comparing Against Mean of Enrollment Gallery')
+plt.legend()
+plt.grid(True)
+
+plt.show()
 
 ## TODO. my own implementation of PLDA for the "two-covariance" flavor
 # Model is that there is a prior on class centers: p(y) ~ N(m, Phi_b) and 
